@@ -35,8 +35,8 @@ export class VerifierRegistryService {
 		// },
 		{
 			id: 1,
-			name: "ACME verifier",
-			url: "https://verifier.ediplomas.gr",
+			name: "Your Friendly Verifier",
+			url: "https://YourFriendlyVerifier.dc4eu.eu",
 			scopes: [
 				{
 					name: "vid",
