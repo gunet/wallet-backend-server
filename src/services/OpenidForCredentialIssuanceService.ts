@@ -116,7 +116,13 @@ export class OpenidForCredentialIssuanceService implements OpenidCredentialRecei
 			credential_offer = new URL(credentialOfferURL).searchParams.get('credential_offer')
 			let credential_offer_uri = new URL(credentialOfferURL).searchParams.get('credential_offer_uri')
 			if (credential_offer_uri) {
-				credential_offer = (await axios.get(credential_offer_uri)).data;
+				try {
+					credential_offer = (await axios.get(credential_offer_uri)).data;
+				}
+				catch(err) {
+					console.log("Failed to get credential offer reference = ", err);
+					return;
+				}
 			}
 			else {
 				credential_offer = JSON.parse(credential_offer)
