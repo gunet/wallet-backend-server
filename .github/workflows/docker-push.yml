@@ -13,7 +13,7 @@ jobs:
       contents: read  # To check out repo
       packages: write # To read NPM registry and push Docker image
 
-    uses: wwwallet/wallet-ecosystem/.github/workflows/docker-build-push.yml@master
+    uses: gunet/wallet-ecosystem/.github/workflows/docker-build-push.yml@master
     with:
-      image-tag: ghcr.io/wwwallet/wallet-backend:latest
+      image-tag: ghcr.io/gunet/wallet-backend-server:latest
       docker-push: true
