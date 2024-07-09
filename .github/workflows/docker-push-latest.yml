@@ -1,0 +1,18 @@
+name: Push Docker image
+on:
+  push:
+    branches:
+      - dc4eu-rome
+
+jobs:
+  push-front:
+    permissions:
+      contents: read
+      packages: write
+
+    uses: gunet/wallet-ecosystem/.github/workflows/docker-build-push.yml@dc4eu-rome
+    secrets: inherit
+    with:
+      image-tag: ghcr.io/gunet/wallet-backend-server:latest
+      docker-push: true
+      dockerfile-path: ./Dockerfile
