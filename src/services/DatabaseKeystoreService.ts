@@ -7,7 +7,7 @@ import { Err, Ok, Result } from "ts-results";
 import { SignVerifiablePresentationJWT, WalletKey } from "@wwwallet/ssi-sdk";
 import { AdditionalKeystoreParameters, DidKeyUtilityService, RegistrationParams, WalletKeystore, WalletKeystoreErr } from "./interfaces";
 import { verifiablePresentationSchemaURL } from "../util/util";
-import { getUserByDID } from "../entities/user.entity";
+import { getUser, UserId } from "../entities/user.entity";
 import { TYPES } from "./types";
 import config from "../../config";
 
@@ -32,34 +32,9 @@ export class DatabaseKeystoreService implements WalletKeystore {
 		}
 	}
 
-	
-	async createIdToken(userDid: string, nonce: string, audience: string, additionalParameters: AdditionalKeystoreParameters): Promise<Result<{ id_token: string; }, WalletKeystoreErr>> {
-		const user = (await getUserByDID(userDid)).unwrap();
-		const keys = JSON.parse(user.keys.toString()) as WalletKey;
 
-		if (!keys.privateKey) {
-			return Err(WalletKeystoreErr.KEYS_UNAVAILABLE);
-		}
-
-		const privateKey = await importJWK(keys.privateKey, keys.alg);
-		const jws = await new SignJWT({ nonce: nonce })
-			.setProtectedHeader({
-				alg: this.algorithm,
-				typ: "JWT",
-				kid: keys.verificationMethod,
-			})
-			.setSubject(user.did)
-			.setIssuer(user.did)
-			.setExpirationTime('1m')
-			.setAudience(audience)
-			.setIssuedAt()
-			.sign(privateKey);
-
-		return Ok({ id_token: jws });
-	}
-
-	async signJwtPresentation(userDid: string, nonce: string, audience: string, verifiableCredentials: any[], additionalParameters: AdditionalKeystoreParameters): Promise<Result<{ vpjwt: string }, WalletKeystoreErr>> {
-		const user = (await getUserByDID(userDid)).unwrap();
+	async signJwtPresentation(userId: UserId, nonce: string, audience: string, verifiableCredentials: any[], additionalParameters: AdditionalKeystoreParameters): Promise<Result<{ vpjwt: string }, WalletKeystoreErr>> {
+		const user = (await getUser(userId)).unwrap();
 		const keys = JSON.parse(user.keys.toString()) as WalletKey;
 		if (!keys.privateKey) {
 			return Err(WalletKeystoreErr.KEYS_UNAVAILABLE);
@@ -90,8 +65,8 @@ export class DatabaseKeystoreService implements WalletKeystore {
 		return Ok({ vpjwt: jws });
 	}
 
-	async generateOpenid4vciProof(userDid: string, audience: string, nonce: string, additionalParameters: AdditionalKeystoreParameters): Promise<Result<{ proof_jwt: string }, WalletKeystoreErr>> {
-		const user = (await getUserByDID(userDid)).unwrap();
+	async generateOpenid4vciProof(userId: UserId, audience: string, nonce: string, additionalParameters: AdditionalKeystoreParameters): Promise<Result<{ proof_jwt: string }, WalletKeystoreErr>> {
+		const user = (await getUser(userId)).unwrap();
 		const keys = JSON.parse(user.keys.toString()) as WalletKey;
 		if (!keys.privateKey) {
 			return Err(WalletKeystoreErr.KEYS_UNAVAILABLE);

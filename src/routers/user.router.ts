@@ -1,5 +1,4 @@
 import express, { Request, Response, Router } from 'express';
-import { SignJWT } from 'jose';
 import * as uuid from 'uuid';
 import crypto from 'node:crypto';
 import * as SimpleWebauthn from '@simplewebauthn/server';
@@ -7,9 +6,9 @@ import base64url from 'base64url';
 import { EntityManager } from "typeorm"
 
 import config from '../../config';
-import { CreateUser, createUser, deleteUserByDID, deleteWebauthnCredential, getUserByCredentials, getUserByDID, getUserByWebauthnCredential, newWebauthnCredentialEntity, updateUserByDID, UpdateUserErr, updateWebauthnCredential, updateWebauthnCredentialById, UserEntity } from '../entities/user.entity';
-import { jsonParseTaggedBinary, jsonStringifyTaggedBinary } from '../util/util';
-import { AuthMiddleware } from '../middlewares/auth.middleware';
+import { CreateUser, createUser, deleteUser, deleteWebauthnCredential, getUserByCredentials, getUser, getUserByWebauthnCredential, GetUserErr, newWebauthnCredentialEntity, privateDataEtag, updateUser, UpdateUserErr, updateWebauthnCredential, updateWebauthnCredentialById, UserEntity, UserId } from '../entities/user.entity';
+import { checkedUpdate, EtagUpdate, jsonParseTaggedBinary } from '../util/util';
+import { AuthMiddleware, createAppToken } from '../middlewares/auth.middleware';
 import { ChallengeErr, createChallenge, popChallenge } from '../entities/WebauthnChallenge.entity';
 import * as webauthn from '../webauthn';
 import * as scrypt from "../scrypt";
@@ -36,20 +35,23 @@ userController.use(AuthMiddleware);
 noAuthUserController.use('/session', userController);
 
 
-async function initSession(user: UserEntity): Promise<{ did: string, appToken: string, username?: string, displayName: string, privateData: string }> {
-	const secret = new TextEncoder().encode(config.appSecret);
-	const appToken = await new SignJWT({ did: user.did })
-		.setProtectedHeader({ alg: "HS256" })
-		.sign(secret);
+async function initSession(user: UserEntity): Promise<{
+	uuid: UserId,
+	appToken: string,
+	username?: string,
+	displayName: string,
+	privateData: Buffer,
+	webauthnRpId: string,
+}> {
 	return {
-		appToken,
-		did: user.did,
+		uuid: user.uuid,
+		appToken: await createAppToken(user),
 		displayName: user.displayName || user.username,
-		privateData: user.privateData.toString(),
+		privateData: user.privateData,
 		username: user.username,
+		webauthnRpId: webauthn.getRpId(),
 	};
 }
-
 
 noAuthUserController.post('/register', async (req: Request, res: Response) => {
 	const username = req.body.username;
@@ -60,7 +62,7 @@ noAuthUserController.post('/register', async (req: Request, res: Response) => {
 	}
 
 	const walletInitializationResult = await walletKeystoreManagerService.initializeWallet(
-		{...req.body as RegistrationParams }
+		{ ...req.body as RegistrationParams }
 	);
 
 	if (walletInitializationResult.err) {
@@ -72,12 +74,13 @@ noAuthUserController.post('/register', async (req: Request, res: Response) => {
 		...walletInitializationResult.unwrap(),
 		username: username ? username : "",
 		passwordHash: passwordHash,
-		webauthnUserHandle: uuid.v4(),
 	};
 
 	const result = (await createUser(newUser));
 	if (result.ok) {
-		res.status(200).send(await initSession(result.val));
+		res.status(200)
+			.header({ 'X-Private-Data-ETag': privateDataEtag(result.val.privateData) })
+			.send(await initSession(result.val));
 
 	} else {
 		console.log("Failed to create user")
@@ -98,18 +101,21 @@ noAuthUserController.post('/login', async (req: Request, res: Response) => {
 	}
 	console.log('user res = ', userRes)
 	const user = userRes.unwrap();
-	res.status(200).send(await initSession(user));
+	res.status(200)
+		.header({ 'X-Private-Data-ETag': privateDataEtag(user.privateData) })
+		.send(await initSession(user));
 })
 
 noAuthUserController.post('/register/db-keys', async (req: Request, res: Response) => {
 })
 
 noAuthUserController.post('/login/db-keys', async (req: Request, res: Response) => {
-	
+
 })
 
 noAuthUserController.post('/register-webauthn-begin', async (req: Request, res: Response) => {
-	const challengeRes = await createChallenge("create", uuid.v4());
+	const userId = UserId.generate();
+	const challengeRes = await createChallenge("create", userId);
 	if (challengeRes.err) {
 		res.status(500).send({});
 		return;
@@ -119,16 +125,16 @@ noAuthUserController.post('/register-webauthn-begin', async (req: Request, res: 
 	const createOptions = webauthn.makeCreateOptions({
 		challenge: challenge.challenge,
 		user: {
-			webauthnUserHandle: challenge.userHandle,
+			uuid: userId,
 			name: "",
 			displayName: "",
 		},
 	});
 
-	res.status(200).send(jsonStringifyTaggedBinary({
+	res.status(200).send({
 		challengeId: challenge.id,
 		createOptions,
-	}));
+	});
 });
 
 noAuthUserController.post('/register-webauthn-finish', async (req: Request, res: Response) => {
@@ -148,7 +154,16 @@ noAuthUserController.post('/register-webauthn-finish', async (req: Request, res:
 
 	const credential = req.body.credential;
 	const verification = await SimpleWebauthn.verifyRegistrationResponse({
-		response: credential,
+		response: {
+			type: credential.type,
+			id: credential.id,
+			rawId: credential.id, // SimpleWebauthn requires this base64url encoded
+			response: {
+				attestationObject: base64url.encode(credential.response.attestationObject),
+				clientDataJSON: base64url.encode(credential.response.clientDataJSON),
+			},
+			clientExtensionResults: credential.clientExtensionResults,
+		},
 		expectedChallenge: base64url.encode(challenge.challenge),
 		expectedOrigin: config.webauthn.origin,
 		expectedRPID: config.webauthn.rp.id,
@@ -156,41 +171,42 @@ noAuthUserController.post('/register-webauthn-finish', async (req: Request, res:
 	});
 
 	if (verification.verified) {
-		const webauthnUserHandle = challenge.userHandle;
-		if (!webauthnUserHandle) {
+		if (!challenge.userId) {
 			res.status(500).send({});
 			return;
 		}
 		const walletInitializationResult = await walletKeystoreManagerService.initializeWallet(
-			{...req.body as RegistrationParams }
+			{ ...req.body as RegistrationParams }
 		);
-	
+
 		if (walletInitializationResult.err) {
 			return res.status(400).send({ error: walletInitializationResult.val })
 		}
 
 		const newUser: CreateUser = {
 			...walletInitializationResult.unwrap(),
-			webauthnUserHandle,
+			uuid: challenge.userId,
 			webauthnCredentials: [
 				newWebauthnCredentialEntity({
-					credentialId: Buffer.from(verification.registrationInfo.credentialID),
-					userHandle: Buffer.from(webauthnUserHandle),
+					credentialId: credential.rawId,
+					_userHandle: challenge.userId.asUserHandle(),
 					nickname: req.body.nickname,
 					publicKeyCose: Buffer.from(verification.registrationInfo.credentialPublicKey),
 					signatureCount: verification.registrationInfo.counter,
 					transports: credential.response.transports || [],
-					attestationObject: Buffer.from(verification.registrationInfo.attestationObject),
-					create_clientDataJSON: Buffer.from(credential.response.clientDataJSON),
+					attestationObject: credential.response.attestationObject,
+					create_clientDataJSON: credential.response.clientDataJSON,
 					prfCapable: credential.clientExtensionResults?.prf?.enabled || false,
 				}),
 			],
 		};
 
-		const userRes = await createUser(newUser, false, );
+		const userRes = await createUser(newUser, false,);
 		if (userRes.ok) {
 			console.log("Created user", userRes.val);
-			res.status(200).send(await initSession(userRes.val));
+			res.status(200)
+				.header({ 'X-Private-Data-ETag': privateDataEtag(userRes.val.privateData) })
+				.send(await initSession(userRes.val));
 		} else {
 			res.status(500).send({});
 		}
@@ -208,20 +224,20 @@ noAuthUserController.post('/login-webauthn-begin', async (req: Request, res: Res
 	const challenge = challengeRes.unwrap();
 	const getOptions = webauthn.makeGetOptions({ challenge: challenge.challenge });
 
-	res.status(200).send(jsonStringifyTaggedBinary({
+	res.status(200).send({
 		challengeId: challenge.id,
 		getOptions,
-	}));
+	});
 });
 
 noAuthUserController.post('/login-webauthn-finish', async (req: Request, res: Response) => {
 	console.log("webauthn login-finish", req.body);
 
 	const credential = req.body.credential;
-	const userHandle = base64url.toBuffer(credential.response.userHandle).toString();
-	const credentialId = base64url.toBuffer(credential.id);
+	const userId = UserId.fromUserHandle(credential.response.userHandle);
+	const credentialId = credential.rawId;
 
-	const userRes = await getUserByWebauthnCredential(userHandle, credentialId);
+	const userRes = await getUserByWebauthnCredential(userId, credentialId);
 	if (userRes.err) {
 		res.status(403).send({});
 		return;
@@ -242,7 +258,17 @@ noAuthUserController.post('/login-webauthn-finish', async (req: Request, res: Re
 	console.log("webauthn login-finish challenge", challenge);
 
 	const verification = await SimpleWebauthn.verifyAuthenticationResponse({
-		response: credential,
+		response: {
+			type: credential.type,
+			id: credential.id,
+			rawId: credential.id, // SimpleWebauthn requires this base64url encoded
+			response: {
+				authenticatorData: base64url.encode(credential.response.authenticatorData),
+				clientDataJSON: base64url.encode(credential.response.clientDataJSON),
+				signature: base64url.encode(credential.response.signature),
+			},
+			clientExtensionResults: credential.clientExtensionResults,
+		},
 		expectedChallenge: base64url.encode(challenge.challenge),
 		expectedOrigin: config.webauthn.origin,
 		expectedRPID: config.webauthn.rp.id,
@@ -262,7 +288,9 @@ noAuthUserController.post('/login-webauthn-finish', async (req: Request, res: Re
 		});
 
 		if (updateCredentialRes.ok) {
-			res.status(200).send(await initSession(user));
+			res.status(200)
+				.header({ 'X-Private-Data-ETag': privateDataEtag(user.privateData) })
+				.send(await initSession(user));
 		} else {
 			res.status(500).send({});
 		}
@@ -274,11 +302,10 @@ noAuthUserController.post('/login-webauthn-finish', async (req: Request, res: Re
 
 
 userController.post('/fcm_token/add', async (req: Request, res: Response) => {
-	const userDID = req.user.did;
-	updateUserByDID(userDID, (userEntity, manager) => {
+	updateUser(req.user.id, (userEntity, manager) => {
 		if (req.body.fcm_token &&
-				req.body.fcm_token != '' &&
-				userEntity.fcmTokenList.filter((fcmTokenEntity) => fcmTokenEntity.value == req.body.fcm_token).length == 0) {
+			req.body.fcm_token != '' &&
+			userEntity.fcmTokenList.filter((fcmTokenEntity) => fcmTokenEntity.value == req.body.fcm_token).length == 0) {
 			const fcmTokenEntity = new FcmTokenEntity();
 			fcmTokenEntity.user = userEntity;
 			fcmTokenEntity.value = req.body.fcm_token;
@@ -292,22 +319,18 @@ userController.post('/fcm_token/add', async (req: Request, res: Response) => {
 })
 
 userController.get('/account-info', async (req: Request, res: Response) => {
-	const userRes = await getUserByDID(req.user.did);
+	const userRes = await getUser(req.user.id);
 	if (userRes.err) {
 		res.status(403).send({});
 		return;
 	}
 	const user = userRes.unwrap();
 
-	const keys = jsonParseTaggedBinary(user.keys.toString());
-
-	res.status(200).send(jsonStringifyTaggedBinary({
+	res.status(200).send({
+		uuid: user.uuid,
 		username: user.username,
 		displayName: user.displayName,
-		did: user.did,
 		hasPassword: user.passwordHash !== null,
-		publicKey: keys.publicKey,
-		webauthnUserHandle: user.webauthnUserHandle,
 		webauthnCredentials: (user.webauthnCredentials || []).map(cred => ({
 			createTime: cred.createTime,
 			credentialId: cred.credentialId,
@@ -316,16 +339,11 @@ userController.get('/account-info', async (req: Request, res: Response) => {
 			nickname: cred.nickname,
 			prfCapable: cred.prfCapable,
 		})),
-	}));
+	});
 })
 
 userController.post('/webauthn/register-begin', async (req: Request, res: Response) => {
-	const userRes = await updateUserByDID(req.user.did, (userEntity, manager) => {
-		if (!userEntity.webauthnUserHandle) {
-			userEntity.webauthnUserHandle = uuid.v4();
-		}
-		return userEntity;
-	});
+	const userRes = await getUser(req.user.id);
 
 	if (userRes.err) {
 		res.status(403).send({});
@@ -334,7 +352,7 @@ userController.post('/webauthn/register-begin', async (req: Request, res: Respon
 	const user = userRes.unwrap();
 
 	const prfSalt = crypto.randomBytes(32);
-	const challengeRes = await createChallenge("create", user.webauthnUserHandle, prfSalt);
+	const challengeRes = await createChallenge("create", user.uuid, prfSalt);
 	if (challengeRes.err) {
 		res.status(500).send({});
 		return;
@@ -349,17 +367,17 @@ userController.post('/webauthn/register-begin', async (req: Request, res: Respon
 		},
 	});
 
-	res.status(200).send(jsonStringifyTaggedBinary({
+	res.status(200).send({
 		username: user.username,
 		challengeId: challenge.id,
 		createOptions,
-	}));
+	});
 });
 
 userController.post('/webauthn/register-finish', async (req: Request, res: Response) => {
 	console.log("webauthn register-finish", req.body);
 
-	const userRes = await getUserByDID(req.user.did);
+	const userRes = await getUser(req.user.id);
 	if (userRes.err) {
 		res.status(403).send({});
 		return;
@@ -381,19 +399,28 @@ userController.post('/webauthn/register-finish', async (req: Request, res: Respo
 
 	const credential = req.body.credential;
 	const verification = await SimpleWebauthn.verifyRegistrationResponse({
-		response: credential,
+		response: {
+			type: credential.type,
+			id: credential.id,
+			rawId: credential.id, // SimpleWebauthn requires this base64url encoded
+			response: {
+				attestationObject: base64url.encode(credential.response.attestationObject),
+				clientDataJSON: base64url.encode(credential.response.clientDataJSON),
+			},
+			clientExtensionResults: credential.clientExtensionResults,
+		},
 		expectedChallenge: base64url.encode(challenge.challenge),
 		expectedOrigin: config.webauthn.origin,
 		expectedRPID: config.webauthn.rp.id,
 	});
 
 	if (verification.verified) {
-		const updateUserRes = await updateUserByDID(user.did, (userEntity, manager) => {
+		const updateUserRes = await updateUser(user.uuid, (userEntity, manager) => {
 			userEntity.webauthnCredentials = userEntity.webauthnCredentials || [];
 			userEntity.webauthnCredentials.push(
 				newWebauthnCredentialEntity({
 					credentialId: Buffer.from(verification.registrationInfo.credentialID),
-					userHandle: Buffer.from(userEntity.webauthnUserHandle),
+					_userHandle: user.uuid.asUserHandle(),
 					nickname: req.body.nickname,
 					publicKeyCose: Buffer.from(verification.registrationInfo.credentialPublicKey),
 					signatureCount: verification.registrationInfo.counter,
@@ -403,16 +430,32 @@ userController.post('/webauthn/register-finish', async (req: Request, res: Respo
 					prfCapable: credential.clientExtensionResults?.prf?.enabled || false,
 				}, manager)
 			);
-			if (req.body.privateData) {
-				userEntity.privateData = Buffer.from(req.body.privateData);
+
+			const newPrivateData = checkedUpdate(
+				req.headers['x-private-data-if-match'],
+				privateDataEtag,
+				{
+					currentValue: userEntity.privateData,
+					newValue: req.body.privateData,
+				},
+			);
+			if (newPrivateData.ok) {
+				userEntity.privateData = newPrivateData.val;
+			} else {
+				return Err(UpdateUserErr.PRIVATE_DATA_CONFLICT);
 			}
+
 			return userEntity;
 		});
 
 		if (updateUserRes.ok) {
-			res.status(200).send(jsonStringifyTaggedBinary({
-				credentialId: credential.id
-			}));
+			res.status(200)
+				.header({ 'X-Private-Data-ETag': privateDataEtag(updateUserRes.val.privateData) })
+				.send({ credentialId: credential.id });
+		} else if (updateUserRes.val === UpdateUserErr.PRIVATE_DATA_CONFLICT) {
+			res.status(412)
+				.header({ 'X-Private-Data-ETag': privateDataEtag(user.privateData) })
+				.send({});
 		} else {
 			res.status(500).send({});
 		}
@@ -425,7 +468,7 @@ userController.post('/webauthn/register-finish', async (req: Request, res: Respo
 userController.post('/webauthn/credential/:id/rename', async (req: Request, res: Response) => {
 	console.log("webauthn rename", req.params.id);
 
-	const updateRes = await updateWebauthnCredentialById(req.user.did, req.params.id, (credentialEntity, manager) => {
+	const updateRes = await updateWebauthnCredentialById(req.user.id, req.params.id, (credentialEntity, manager) => {
 		credentialEntity.nickname = req.body.nickname || null;
 		return credentialEntity;
 	});
@@ -446,16 +489,22 @@ userController.post('/webauthn/credential/:id/rename', async (req: Request, res:
 userController.post('/webauthn/credential/:id/delete', async (req: Request, res: Response) => {
 	console.log("webauthn delete", req.params.id);
 
-	const userRes = await getUserByDID(req.user.did);
+	const userRes = await getUser(req.user.id);
 	if (userRes.err) {
 		res.status(403).send({});
 		return;
 	}
 	const user = userRes.unwrap();
 
-	const deleteRes = await deleteWebauthnCredential(user, req.params.id, Buffer.from(req.body.privateData));
+	const updatePrivateData: EtagUpdate<Buffer> = {
+		expectTag: req.headers['x-private-data-if-match'] as string,
+		newValue: req.body.privateData,
+	};
+	const deleteRes = await deleteWebauthnCredential(user, req.params.id, updatePrivateData);
 	if (deleteRes.ok) {
-		res.status(204).send();
+		res.status(204)
+			.header({ 'X-Private-Data-ETag': privateDataEtag(updatePrivateData.newValue) })
+			.send();
 	} else {
 		if (deleteRes.val === UpdateUserErr.NOT_EXISTS) {
 			res.status(404).send();
@@ -463,24 +512,82 @@ userController.post('/webauthn/credential/:id/delete', async (req: Request, res:
 		} else if (deleteRes.val === UpdateUserErr.LAST_WEBAUTHN_CREDENTIAL) {
 			res.status(409).send();
 
+		} else if (deleteRes.val === UpdateUserErr.PRIVATE_DATA_CONFLICT) {
+			res.status(412)
+				.header({ 'X-Private-Data-ETag': privateDataEtag(updatePrivateData.newValue) })
+				.send();
+
 		} else {
 			res.status(500).send();
 		}
 	}
 })
 
+userController.post('/private-data', async (req: Request, res: Response) => {
+	const updateUserRes = await updateUser(req.user.id, userEntity => {
+		const newPrivateData = checkedUpdate(
+			req.headers['x-private-data-if-match'],
+			privateDataEtag,
+			{
+				currentValue: userEntity.privateData,
+				newValue: req.body,
+			},
+		);
+		if (newPrivateData.ok) {
+			userEntity.privateData = newPrivateData.val;
+			return Ok(userEntity);
+		} else {
+			return Err([UpdateUserErr.PRIVATE_DATA_CONFLICT, userEntity]);
+		}
+	});
+
+	if (updateUserRes.ok) {
+		res.status(204)
+			.header({ 'X-Private-Data-ETag': privateDataEtag(updateUserRes.val.privateData) })
+			.send();
+	} else {
+		if (updateUserRes.val === UpdateUserErr.NOT_EXISTS) {
+			res.status(404).send();
+
+		} else if (updateUserRes.val[0] === UpdateUserErr.PRIVATE_DATA_CONFLICT) {
+			res.status(412)
+				.header({ 'X-Private-Data-ETag': privateDataEtag(updateUserRes.val[1].privateData) })
+				.send();
+
+		} else {
+			res.status(500).send();
+		}
+	}
+});
+
+userController.get('/private-data', async (req: Request, res: Response) => {
+	const userRes = await getUser(req.user.id);
+	if (userRes.ok) {
+		const privateData = userRes.val.privateData;
+		res.status(200)
+			.header({ 'X-Private-Data-ETag': privateDataEtag(privateData) })
+			.send({ privateData });
+	} else {
+		if (userRes.val === GetUserErr.NOT_EXISTS) {
+			res.status(404).send();
+
+		} else {
+			res.status(500).send();
+		}
+	}
+});
+
 userController.delete('/', async (req: Request, res: Response) => {
-	const userDID = req.user.did;
 	try {
 		await runTransaction(async (entityManager: EntityManager) => {
 			// Note: this executes all four branches before checking if any failed.
 			// ts-results does not seem to provide an async-optimized version of Result.all(),
 			// and it turned out nontrivial to write one that preserves the Ok and Err types like Result.all() does.
 			return Result.all(
-				await deleteAllFcmTokensForUser(userDID, { entityManager }),
-				await deleteAllCredentialsWithHolderDID(userDID, { entityManager }),
-				await deleteAllPresentationsWithHolderDID(userDID, { entityManager }),
-				await deleteUserByDID(userDID, { entityManager }),
+				await deleteAllFcmTokensForUser(req.user.id, { entityManager }),
+				await deleteAllCredentialsWithHolderDID(req.user.did, { entityManager }),
+				await deleteAllPresentationsWithHolderDID(req.user.did, { entityManager }),
+				await deleteUser(req.user.id, { entityManager }),
 			);
 		});
 
@@ -489,25 +596,5 @@ userController.delete('/', async (req: Request, res: Response) => {
 		return res.status(400).send({ result: e })
 	}
 });
-// /**
-//  * expect 'alg' query parameter
-//  */
-// userController.get('/keys/public', AuthMiddleware, async (req: Request, res: Response) => {
-// 	const did = req.user?.did;
-// 	const algorithm = req.query["alg"] as string;
-// 	if (did == undefined) {
-// 		res.status(401).send({ err: 'UNAUTHORIZED' });
-// 		return;
-// 	}
-// 	const alg: SigningAlgorithm = algorithm as SigningAlgorithm;
-// 	const result = await getPublicKey(did, algorithm as SigningAlgorithm);
-// 	if (!result) {
-// 		res.status(500).send();
-// 		return;
-// 	}
-// 	const { publicKeyJwk } = result;
-
-// 	res.send({ publicKeyJwk });
-// });
 
 export default noAuthUserController;

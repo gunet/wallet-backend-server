@@ -3,7 +3,7 @@ import express, { Router } from 'express';
 import { AuthMiddleware } from '../middlewares/auth.middleware';
 import _ from 'lodash';
 import { appContainer } from '../services/inversify.config';
-import { HandleOutboundRequestError, IssuanceErr, OpenidCredentialReceiving, OutboundCommunication, SendResponseError } from '../services/interfaces';
+import { HandleOutboundRequestError, OpenidCredentialReceiving, OutboundCommunication, SendResponseError } from '../services/interfaces';
 import { TYPES } from '../services/types';
 import * as z from 'zod';
 
@@ -44,7 +44,7 @@ communicationHandlerRouter.post('/handle', async (req, res) => {
 	if (generateAuthorizationRequestSchemaResult.success) {
 		try {
 			const { legal_person_did } = req.body;
-			const result = await openidForCredentialIssuanceService.generateAuthorizationRequestURL(req.user.did, null, legal_person_did);
+			const result = await openidForCredentialIssuanceService.generateAuthorizationRequestURL(req.user.id, null, legal_person_did);
 			console.log("Succesfully handled by generateAuthorizationRequestURL");
 			return res.send(result);
 		}
@@ -57,7 +57,7 @@ communicationHandlerRouter.post('/handle', async (req, res) => {
 			const {
 				url,
 			} = req.body;
-			const result = await openidForCredentialIssuanceService.generateAuthorizationRequestURL(req.user.did, url, null);
+			const result = await openidForCredentialIssuanceService.generateAuthorizationRequestURL(req.user.id, url, null);
 			console.log("Successfully handled by generateAuthorizationRequestURL");
 			return res.send(result);
 		}
@@ -70,11 +70,11 @@ communicationHandlerRouter.post('/handle', async (req, res) => {
 			const {
 				url,
 			} = req.body;
-	
+
 			if (!(new URL(url).searchParams.get("code"))) {
 				throw new Error("No code was provided");
 			}
-			const result = await openidForCredentialIssuanceService.handleAuthorizationResponse(req.user.did, url);
+			const result = await openidForCredentialIssuanceService.handleAuthorizationResponse(req.user.id, url);
 			if (result.ok) {
 				console.log("Successfully handled by handleAuthorizationResponse");
 				return res.send({});
@@ -89,8 +89,8 @@ communicationHandlerRouter.post('/handle', async (req, res) => {
 			const {
 				user_pin
 			} = req.body;
-	
-			const response = await openidForCredentialIssuanceService.requestCredentialsWithPreAuthorizedGrant(req.user.did, user_pin);
+
+			const response = await openidForCredentialIssuanceService.requestCredentialsWithPreAuthorizedGrant(req.user.id, user_pin);
 			console.log("Response = ", response)
 			if (response.error) {
 				return res.status(401).send({ error: response.error });
@@ -105,7 +105,7 @@ communicationHandlerRouter.post('/handle', async (req, res) => {
 	if (handleSIOPRequestResult.success) {
 		const { url, camera_was_used } = handleSIOPRequestResult.data;
 		try {
-			const outboundRequestResult = await openidForPresentationService.handleRequest(req.user.did, url, camera_was_used);
+			const outboundRequestResult = await openidForPresentationService.handleRequest(req.user.id, url, camera_was_used);
 			if (!outboundRequestResult.ok) {
 				if (outboundRequestResult.val == HandleOutboundRequestError.INSUFFICIENT_CREDENTIALS) {
 					return res.send({ error: HandleOutboundRequestError.INSUFFICIENT_CREDENTIALS });
@@ -139,17 +139,17 @@ communicationHandlerRouter.post('/handle', async (req, res) => {
 		const {
 			verifiable_credentials_map, // { "descriptor_id1": "urn:vid:123", "descriptor_id1": "urn:vid:645" }
 		} = req.body;
-	
+
 		console.log("Credentials map = ", verifiable_credentials_map)
 		const selection = new Map(Object.entries(verifiable_credentials_map)) as Map<string, string>;
 		console.log("Selection = ", verifiable_credentials_map)
 		try {
-			const result = await openidForPresentationService.sendResponse(req.user.did, selection);
-	
+			const result = await openidForPresentationService.sendResponse(req.user.id, selection);
+
 			if (!result.ok) {
 				return res.send({ error: SendResponseError.SEND_RESPONSE_ERROR });
 			}
-	
+
 			const { redirect_to } = result.val;
 			console.log("Successfully handled by sendResponse");
 			return res.send({ redirect_to });
@@ -157,7 +157,7 @@ communicationHandlerRouter.post('/handle', async (req, res) => {
 		catch(error) {
 			const errText = `Error generating authorization response: ${error}`;
 			console.log(errText);
-		}	
+		}
 	}
 	return res.status(400).send({ error: "Could not handle" });
 });
