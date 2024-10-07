@@ -5,7 +5,7 @@ on:
       - dc4eu-rome
 
 jobs:
-  push-front:
+  push-backend:
     permissions:
       contents: read
       packages: write
